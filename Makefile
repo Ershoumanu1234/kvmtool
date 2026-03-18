@@ -131,6 +131,8 @@ endif
 #x86
 ifeq ($(ARCH),x86)
 	DEFINES += -DCONFIG_X86
+	DEFINES += -DCONFIG_HAS_GDB_STUB
+	OBJS	+= gdb.o
 	OBJS	+= hw/i8042.o
 	OBJS	+= hw/serial.o
 	OBJS	+= x86/boot.o
@@ -140,6 +142,7 @@ ifeq ($(ARCH),x86)
 	OBJS	+= x86/irq.o
 	OBJS	+= x86/kvm.o
 	OBJS	+= x86/kvm-cpu.o
+	OBJS	+= x86/gdb.o
 	OBJS	+= x86/mptable.o
 # Exclude BIOS object files from header dependencies.
 	OTHEROBJS	+= x86/bios.o
@@ -188,6 +191,7 @@ endif
 # ARM64
 ifeq ($(ARCH), arm64)
 	DEFINES		+= -DCONFIG_ARM64
+	OBJS		+= gdb.o
 	OBJS		+= $(OBJS_ARM_COMMON)
 	OBJS		+= arm/aarch64/arm-cpu.o
 	OBJS		+= arm/aarch64/kvm-cpu.o
@@ -551,10 +555,17 @@ x86/bios/bios-rom.h: x86/bios/bios.bin.elf
 	$(E) "  NM      " $@
 	$(Q) cd x86/bios && sh gen-offsets.sh > bios-rom.h && cd ..
 
+
+BOOT_TEST_KERNEL ?= $(firstword $(wildcard /boot/vmlinuz-$(shell uname -r) /boot/vmlinuz-* /boot/vmlinuz))
+
 check: all
 	$(MAKE) -C tests
 	./$(PROGRAM) run tests/pit/tick.bin
-	./$(PROGRAM) run -d tests/boot/boot_test.iso -p "init=init"
+	@if [ -n "$(BOOT_TEST_KERNEL)" ] && [ -r "$(BOOT_TEST_KERNEL)" ]; then \
+		./$(PROGRAM) run -k "$(BOOT_TEST_KERNEL)" -d tests/boot/boot_test.iso -p "init=init"; \
+	else \
+		echo "SKIP: boot runtime check (no readable /boot/vmlinuz* found)."; \
+	fi
 .PHONY: check
 
 install: all
