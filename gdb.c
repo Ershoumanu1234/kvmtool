@@ -47,12 +47,45 @@
 #include <ctype.h>
 #include <unistd.h>
 
+#ifdef CONFIG_ARM64
+/*
+ * KVM register ID for TTBR1_EL1: S3_0_C2_C0_1
+ * op0=3, op1=0, CRn=2, CRm=0, op2=1
+ * Built without including arch headers to keep gdb.c architecture-agnostic.
+ */
+# define GDB_KVM_REG_ARM64		0x6000000000000000ULL
+# define GDB_KVM_REG_ARM64_SYSREG	(0x0013ULL << 16)
+# define GDB_KVM_REG_SIZE_U64		0x0030000000000000ULL
+# define GDB_ARM64_SYSREG(op0,op1,crn,crm,op2) \
+	(GDB_KVM_REG_ARM64 | GDB_KVM_REG_SIZE_U64 | GDB_KVM_REG_ARM64_SYSREG | \
+	 (((u64)(op0) & 0x3)  << 14) | \
+	 (((u64)(op1) & 0x7)  << 11) | \
+	 (((u64)(crn) & 0xf)  <<  7) | \
+	 (((u64)(crm) & 0xf)  <<  3) | \
+	 (((u64)(op2) & 0x7)  <<  0))
+# define GDB_KVM_REG_TTBR1_EL1		GDB_ARM64_SYSREG(3, 0, 2, 0, 1)
+#endif
+
 #include <linux/kvm.h>
 
 #define GDB_MAX_SW_BP		64
 #define GDB_MAX_HW_BP		4
 #define GDB_PACKET_MAX		16384
-#define GDB_SW_BP_INSN		0xCC	/* INT3 */
+
+#ifdef CONFIG_ARM64
+/*
+ * ARM64 software breakpoint: BRK #0 (little-endian 4-byte encoding)
+ * Encoding: 0xD4200000  →  bytes: 0x00 0x00 0x20 0xD4
+ */
+# define GDB_SW_BP_INSN_LEN	4
+static const u8 GDB_SW_BP_INSN[4] = { 0x00, 0x00, 0x20, 0xD4 };
+#else
+/*
+ * x86 software breakpoint: INT3 (1-byte opcode 0xCC)
+ */
+# define GDB_SW_BP_INSN_LEN	1
+static const u8 GDB_SW_BP_INSN[1] = { 0xCC };
+#endif
 
 /*
  * Only use raw address-as-GPA fallback for very low addresses where
@@ -63,7 +96,7 @@
 /* Software breakpoint saved state */
 struct sw_bp {
 	u64  addr;
-	u8   orig_byte;
+	u8   orig_bytes[GDB_SW_BP_INSN_LEN];	/* original instruction bytes */
 	int  refs;
 	bool active;
 };
@@ -368,8 +401,8 @@ static int sw_bp_restore(int idx)
 		return -1;
 
 	return gdb_write_guest_mem(gdb.sw_bp[idx].addr,
-				  &gdb.sw_bp[idx].orig_byte,
-				  1) ? 0 : -1;
+				  gdb.sw_bp[idx].orig_bytes,
+				  GDB_SW_BP_INSN_LEN) ? 0 : -1;
 }
 
 static int sw_bp_reinsert(int idx)
@@ -377,10 +410,9 @@ static int sw_bp_reinsert(int idx)
 	if (idx < 0 || idx >= GDB_MAX_SW_BP || !gdb.sw_bp[idx].active)
 		return -1;
 
-	u8 brk = GDB_SW_BP_INSN;
 	return gdb_write_guest_mem(gdb.sw_bp[idx].addr,
-				  &brk,
-				  1) ? 0 : -1;
+				  GDB_SW_BP_INSN,
+				  GDB_SW_BP_INSN_LEN) ? 0 : -1;
 }
 
 static bool prepare_sw_bp_resume(bool auto_resume)
@@ -537,9 +569,201 @@ static struct kvm_cpu *current_vcpu(void)
  *   This offset is fixed in the x86-64 ABI regardless of KASLR.
  */
 #ifdef CONFIG_X86
+/*
+ * x86-64 Linux kernel virtual address layout (with nokaslr):
+ *   __START_KERNEL_map  0xffffffff80000000  kernel text, GPA = GVA - base
+ *   PAGE_OFFSET         0xffff888000000000  direct phys map, GPA = GVA - base
+ */
 # define GDB_KERNEL_MAP_BASE	0xffffffff80000000ULL
 # define GDB_DIRECT_MAP_BASE	0xffff888000000000ULL
 # define GDB_DIRECT_MAP_SIZE	0x100000000000ULL	/* 16 TB */
+#endif
+
+#ifdef CONFIG_ARM64
+/*
+ * ARM64 Linux kernel virtual address layout:
+ *
+ * Linear map (PAGE_OFFSET):
+ *   The kernel maps all physical RAM at PAGE_OFFSET.  The exact value
+ *   depends on VA_BITS (48 or 52), but for a standard kernel with VA_BITS=48:
+ *     PAGE_OFFSET = 0xffff000000000000
+ *   With VA_BITS=39 (some embedded configs):
+ *     PAGE_OFFSET = 0xffffff8000000000
+ *   Formula: GPA = GVA - PAGE_OFFSET
+ *
+ * Kernel text / vmalloc (KIMAGE_VADDR):
+ *   Standard arm64 kernel is linked at 0xffff800008000000 (VA_BITS=48).
+ *   The kernel image occupies [KIMAGE_VADDR, KIMAGE_VADDR + TEXT_OFFSET + size).
+ *   For kvmtool guests, the default load address is usually 0x80000 (physical),
+ *   so kernel text GPA ≈ GVA - 0xffff800008000000 + 0x80000
+ *   = GVA - 0xffff800007f80000.
+ *
+ *   Simpler approximation: treat the full vmalloc/kernel range as a linear
+ *   region from 0xffff800000000000 onward, with offset 0xffff800000000000 -
+ *   PHYS_OFFSET where PHYS_OFFSET is typically 0x40000000 on kvmtool guests.
+ *
+ * In practice, KVM_TRANSLATE works correctly when the vCPU is paused in EL1
+ * (kernel mode).  The fallback is only needed when the vCPU is paused in EL0
+ * (userspace) with TTBR1_EL1 loaded but active stage-1 translation using
+ * TTBR0_EL1 (user page table) which does not cover kernel addresses.
+ *
+ * We use the same strategy as x86: check for the well-known linear map range
+ * first, then fall back to the kernel image range.
+ *
+ * PAGE_OFFSET for VA_BITS=48:  0xffff000000000000
+ * All kernel virtual addresses are ≥ 0xffff000000000000.
+ * kvmtool maps guest RAM at physical 0x40000000 (ARM64 default).
+ *
+ * Linear map formula:  GPA = GVA - 0xffff000000000000 + 0
+ *   (works because kvmtool's physical memory starts at GPA 0x0 in the slot,
+ *    but the guest itself sees RAM at IPA 0x40000000.  See arm/kvm.c.)
+ *
+ * Kernel image formula: GPA = GVA - 0xffff800008000000 + 0x80000
+ *   Approximated as:    GPA = GVA - 0xffff800007f80000
+ *
+ * Because these offsets vary by kernel config, this fallback is a best-effort
+ * heuristic; use nokaslr and ensure the vCPU is in EL1 for reliable results.
+ */
+
+/* VA_BITS=48 linear map base (PAGE_OFFSET) */
+# define GDB_ARM64_PAGE_OFFSET		0xffff000000000000ULL
+/* kvmtool ARM64 guest RAM starts at IPA 0x80000000 (ARM_MEMORY_AREA) */
+# define GDB_ARM64_PHYS_OFFSET		0x80000000ULL
+# define GDB_ARM64_LINEAR_MAP_SIZE	0x1000000000000ULL  /* 256 TB region */
+
+/* Kernel image virtual base (KIMAGE_VADDR, VA_BITS=48) */
+# define GDB_ARM64_KIMAGE_VADDR		0xffff800008000000ULL
+/* TEXT_OFFSET: read from kernel image header; 0x0 for newer kernels, 0x80000 for older */
+# define GDB_ARM64_TEXT_OFFSET		0x0ULL
+
+/*
+ * arm64_sw_walk_ttbr1() - software walk of the kernel stage-1 page table.
+ *
+ * KVM_TRANSLATE is not implemented on ARM64 (returns ENXIO).  Instead we
+ * manually walk the TTBR1_EL1 4-level page table that the guest kernel uses
+ * for all kernel virtual addresses (bit[55] == 1, i.e. TTBR1 range).
+ *
+ * Supports 4KB granule, VA_BITS=48 (the most common arm64 Linux config):
+ *   Level 0 (PGD): bits [47:39]  →  9 bits, 512 entries
+ *   Level 1 (PUD): bits [38:30]  →  9 bits, 512 entries
+ *   Level 2 (PMD): bits [29:21]  →  9 bits, 512 entries
+ *   Level 3 (PTE): bits [20:12]  →  9 bits, 512 entries
+ *   Page offset:   bits [11:0]   → 12 bits
+ *
+ * Each entry is 8 bytes.  Bits [47:12] of a non-block entry hold the next
+ * table's IPA (= GPA in kvmtool's flat Stage-2 identity map).
+ *
+ * Block entries:
+ *   L1 block: 1 GB,  output address = entry[47:30] << 30
+ *   L2 block: 2 MB,  output address = entry[47:21] << 21
+ *
+ * Entry validity:
+ *   bit[0] == 1:  valid
+ *   bit[1] == 1:  table (if at L0/L1/L2), page (if at L3)
+ *   bit[1] == 0:  block (if at L1/L2), reserved (if at L0)
+ *
+ * Returns the GPA on success, (u64)-1 on failure.
+ */
+static u64 arm64_sw_walk_ttbr1(u64 gva)
+{
+	struct kvm_cpu *cur = current_vcpu();
+	struct kvm_one_reg reg;
+	u64 ttbr1;
+
+	if (!cur) {
+		pr_warning("GDB: arm64_walk: no current_vcpu");
+		return (u64)-1;
+	}
+
+	/*
+	 * Read TTBR1_EL1.  The ASID field is in bits [63:48]; the base
+	 * address is in bits [47:1] (BADDR), effectively [47:12] for 4KB
+	 * granule after masking ASID and CnP.
+	 */
+	reg.id   = GDB_KVM_REG_TTBR1_EL1;
+	reg.addr = (u64)&ttbr1;
+	if (ioctl(cur->vcpu_fd, KVM_GET_ONE_REG, &reg) < 0) {
+		pr_warning("GDB: arm64_walk: KVM_GET_ONE_REG(TTBR1_EL1) failed: %s",
+			   strerror(errno));
+		return (u64)-1;
+	}
+
+	/* Strip ASID (bits [63:48]) and CnP (bit[0]) to get table base GPA */
+	u64 tbl = ttbr1 & 0x0000fffffffff000ULL;
+
+	pr_debug("GDB: arm64_walk GVA=0x%llx TTBR1=0x%llx tbl=0x%llx",
+		 (unsigned long long)gva,
+		 (unsigned long long)ttbr1,
+		 (unsigned long long)tbl);
+
+	/* VA bits for each level (4KB granule, VA_BITS=48) */
+	int shifts[4] = { 39, 30, 21, 12 };
+	u64 masks[4]  = { 0x1ff, 0x1ff, 0x1ff, 0x1ff };
+
+	for (int level = 0; level < 4; level++) {
+		u64 idx   = (gva >> shifts[level]) & masks[level];
+		u64 entry_gpa = tbl + idx * 8;
+
+		/* Read the 8-byte page-table entry from guest memory */
+		u8  *host = guest_flat_to_host(gdb.kvm, entry_gpa);
+		if (!host || !host_ptr_in_ram(gdb.kvm, host) ||
+		    !host_ptr_in_ram(gdb.kvm, host + 7)) {
+			pr_warning("GDB: arm64_walk L%d: entry_gpa=0x%llx not in RAM (tbl=0x%llx idx=%llu)",
+				   level,
+				   (unsigned long long)entry_gpa,
+				   (unsigned long long)tbl,
+				   (unsigned long long)idx);
+			return (u64)-1;
+		}
+
+		u64 pte;
+		memcpy(&pte, host, 8);
+
+		pr_debug("GDB: arm64_walk L%d idx=%llu entry_gpa=0x%llx pte=0x%llx",
+			 level, (unsigned long long)idx,
+			 (unsigned long long)entry_gpa,
+			 (unsigned long long)pte);
+
+		/* Entry must be valid (bit[0]) */
+		if (!(pte & 1ULL)) {
+			pr_warning("GDB: arm64_walk L%d: pte=0x%llx not valid",
+				   level, (unsigned long long)pte);
+			return (u64)-1;
+		}
+
+		if (level == 3) {
+			/* L3 page entry: output address = pte[47:12] */
+			u64 pa = (pte & 0x0000fffffffff000ULL) |
+				 (gva & 0xfffULL);
+			pr_debug("GDB: arm64_walk -> PA=0x%llx", (unsigned long long)pa);
+			return pa;
+		}
+
+		/* bit[1]: 0 = block, 1 = table */
+		if (!(pte & 2ULL)) {
+			/* Block entry at L1 (1GB) or L2 (2MB) */
+			if (level == 1) {
+				u64 pa = (pte & 0x0000ffffc0000000ULL) |
+					 (gva & 0x3fffffffULL);
+				pr_debug("GDB: arm64_walk L1 block -> PA=0x%llx", (unsigned long long)pa);
+				return pa;
+			} else if (level == 2) {
+				u64 pa = (pte & 0x0000ffffffe00000ULL) |
+					 (gva & 0x1fffffULL);
+				pr_debug("GDB: arm64_walk L2 block -> PA=0x%llx", (unsigned long long)pa);
+				return pa;
+			}
+			/* L0 block is reserved */
+			pr_warning("GDB: arm64_walk L%d: unexpected block entry", level);
+			return (u64)-1;
+		}
+
+		/* Table entry: next level base = pte[47:12] */
+		tbl = pte & 0x0000fffffffff000ULL;
+	}
+
+	return (u64)-1;
+}
 #endif
 
 /*
@@ -548,14 +772,14 @@ static struct kvm_cpu *current_vcpu(void)
  * Uses three strategies in order:
  *
  * 1. KVM_TRANSLATE on the currently selected vCPU.
- *    Fails when the vCPU was paused in user mode with Linux KPTI active,
- *    because the user-mode page table (CR3) does not map kernel addresses.
+ *    Fails when the vCPU was paused in user mode (Linux KPTI / ARM64 TTBR0)
+ *    because the user-mode page table does not map kernel addresses.
  *
  * 2. KVM_TRANSLATE on every other vCPU.
  *    On multi-vCPU systems, another vCPU may be paused in kernel mode
- *    whose page tables do include kernel mappings.
+ *    whose page tables include kernel mappings.
  *
- * 3. Fixed-offset arithmetic for well-known Linux x86-64 kernel ranges.
+ * 3. Fixed-offset arithmetic for well-known Linux kernel ranges.
  *    This is the safety net for single-vCPU systems where ALL vCPUs are
  *    paused in user mode (common when debugging a booted VM running a
  *    shell).  Only reliable with the nokaslr kernel parameter.
@@ -577,12 +801,11 @@ static u64 gva_to_gpa(u64 gva)
 	/*
 	 * Strategy 2: try every other vCPU.
 	 *
-	 * Linux KPTI uses separate CR3 values for user mode and kernel mode.
-	 * If the selected vCPU was interrupted while running a userspace
-	 * process its CR3 points to the user-mode page table, which does NOT
-	 * map kernel virtual addresses (0xffffffff8xxxxxxx).  A different
-	 * vCPU that was paused inside the kernel will have the kernel-mode
-	 * CR3 loaded and can translate those addresses successfully.
+	 * x86 Linux KPTI / ARM64: user-mode page tables do NOT map kernel
+	 * virtual addresses.  If the selected vCPU was interrupted while
+	 * running a userspace process, a different vCPU that was paused inside
+	 * the kernel will have the kernel-mode page table loaded and can
+	 * translate kernel addresses successfully.
 	 */
 	for (int i = 0; i < gdb.kvm->nrcpus; i++) {
 		struct kvm_cpu *vcpu = gdb.kvm->cpus[i];
@@ -596,11 +819,10 @@ static u64 gva_to_gpa(u64 gva)
 
 #ifdef CONFIG_X86
 	/*
-	 * Strategy 3: fixed-offset fallback for x86-64 Linux kernel ranges.
+	 * Strategy 3 (x86-64): fixed-offset fallback for Linux kernel ranges.
 	 *
 	 * When ALL vCPUs are paused in user mode (e.g. a single-vCPU VM
 	 * running a shell), KVM_TRANSLATE will fail for every kernel address.
-	 * We fall back to the known-fixed virtual→physical offsets.
 	 *
 	 * Direct physical map (PAGE_OFFSET): always fixed, KASLR-safe.
 	 * Kernel text/data (__START_KERNEL_map): fixed only with nokaslr.
@@ -611,6 +833,54 @@ static u64 gva_to_gpa(u64 gva)
 
 	if (gva >= GDB_KERNEL_MAP_BASE)
 		return gva - GDB_KERNEL_MAP_BASE;
+#endif
+
+#ifdef CONFIG_ARM64
+	/*
+	 * Strategy 3 (ARM64): software page-table walk via TTBR1_EL1.
+	 *
+	 * KVM_TRANSLATE is NOT implemented on ARM64 (always returns ENXIO).
+	 * Instead we read TTBR1_EL1 (kernel page-table base) and walk the
+	 * stage-1 4-level page table in software using guest_flat_to_host()
+	 * to access guest memory.
+	 *
+	 * This works correctly regardless of KASLR or non-standard PHYS_OFFSET,
+	 * as long as:
+	 *   - The vCPU has TTBR1_EL1 configured (true after MMU is enabled).
+	 *   - kvmtool's stage-2 IPA→GPA mapping is a flat identity (it is).
+	 *   - The granule is 4KB with VA_BITS=48 (standard arm64 Linux).
+	 *
+	 * Fallback to fixed-offset arithmetic is kept for early boot (MMU off)
+	 * or unusual kernel configs.
+	 */
+	if (gva >= 0xffff000000000000ULL) {
+		u64 gpa = arm64_sw_walk_ttbr1(gva);
+		if (gpa != (u64)-1)
+			return gpa;
+	}
+
+	/*
+	 * Fixed-offset fallback (best-effort, requires nokaslr):
+	 *
+	 *   Linear map  [0xffff000000000000, 0xffff000000000000 + 256TB):
+	 *     GPA = GVA - PAGE_OFFSET + PHYS_OFFSET
+	 *   Kernel image [0xffff800000000000, ...):
+	 *     GPA = GVA - KIMAGE_VADDR + TEXT_OFFSET + PHYS_OFFSET
+	 *
+	 * These constants match VA_BITS=48, 4KB granule, kvmtool default
+	 * PHYS_OFFSET=0x40000000, TEXT_OFFSET=0x80000.
+	 */
+
+	/* Linear map range: [PAGE_OFFSET, PAGE_OFFSET + LINEAR_MAP_SIZE) */
+	if (gva >= GDB_ARM64_PAGE_OFFSET &&
+	    gva <  GDB_ARM64_PAGE_OFFSET + GDB_ARM64_LINEAR_MAP_SIZE)
+		return gva - GDB_ARM64_PAGE_OFFSET + GDB_ARM64_PHYS_OFFSET;
+
+	/* Kernel image / vmalloc range: [0xffff800000000000, ...) */
+	if (gva >= GDB_ARM64_KIMAGE_VADDR)
+		return gva - GDB_ARM64_KIMAGE_VADDR
+		       + GDB_ARM64_TEXT_OFFSET
+		       + GDB_ARM64_PHYS_OFFSET;
 #endif
 
 	return (u64)-1;
@@ -704,21 +974,20 @@ static int sw_bp_insert(u64 addr, int len)
 		if (gdb.sw_bp[i].refs > 0)
 			continue;
 
-		u8 orig;
-		if (!gdb_read_guest_mem(addr, &orig, 1)) {
+		if (!gdb_read_guest_mem(addr, gdb.sw_bp[i].orig_bytes,
+					GDB_SW_BP_INSN_LEN)) {
 			pr_warning("GDB: sw_bp_insert read failed at GVA 0x%llx",
 				   (unsigned long long)addr);
 			return -1;
 		}
-		u8 brk = GDB_SW_BP_INSN;
-		if (!gdb_write_guest_mem(addr, &brk, 1)) {
+		if (!gdb_write_guest_mem(addr, GDB_SW_BP_INSN,
+					 GDB_SW_BP_INSN_LEN)) {
 			pr_warning("GDB: sw_bp_insert write failed at GVA 0x%llx",
 				   (unsigned long long)addr);
 			return -1;
 		}
 
 		gdb.sw_bp[i].addr   = addr;
-		gdb.sw_bp[i].orig_byte = orig;
 		gdb.sw_bp[i].refs   = 1;
 		gdb.sw_bp[i].active = true;
 		return 0;
@@ -736,7 +1005,8 @@ static int sw_bp_remove(u64 addr, int len)
 			return 0;
 
 		if (gdb.sw_bp[i].active)
-			gdb_write_guest_mem(addr, &gdb.sw_bp[i].orig_byte, 1);
+			gdb_write_guest_mem(addr, gdb.sw_bp[i].orig_bytes,
+				    GDB_SW_BP_INSN_LEN);
 		gdb.sw_bp[i].active = false;
 		return 0;
 	}
@@ -761,7 +1031,8 @@ static void sw_bp_remove_all(void)
 			continue;
 		if (gdb.sw_bp[i].active)
 			gdb_write_guest_mem(gdb.sw_bp[i].addr,
-					    &gdb.sw_bp[i].orig_byte, 1);
+					    gdb.sw_bp[i].orig_bytes,
+					    GDB_SW_BP_INSN_LEN);
 		gdb.sw_bp[i].refs = 0;
 		gdb.sw_bp[i].active = false;
 	}

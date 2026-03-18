@@ -15,28 +15,25 @@
 
 ## 2. 总体架构
 
-### 2.0 图形化视图（Mermaid）
-
-```mermaid
-flowchart LR
-    GDB[GDB Client] <-->|RSP/TCP| STUB[gdb.c 通用协议层]
-    STUB <-->|arch callback| X86[x86/gdb.c]
-    STUB <-->|arch callback| A64[arm/aarch64/gdb.c]
-    X86 --> KVM[KVM ioctls]
-    A64 --> KVM
-    KVM --> GUEST[Guest vCPU / Kernel]
 ```
-
-```text
-GDB Client
-   <== TCP / RSP ==>
-gdb.c（通用协议层）
-   <== 架构回调 ==>
-x86/gdb.c | arm/aarch64/gdb.c（架构实现层）
-   <== ioctl ==>
-KVM
-   <== VM Run Loop ==>
-Guest
+┌──────────────────────────────────────────────────────────────┐
+│  Host                                                        │
+│                                                              │
+│  ┌─────────┐  GDB RSP over TCP   ┌────────────────────────┐ │
+│  │  GDB    │ ◄──────────────────► │  kvmtool GDB stub      │ │
+│  │(client) │  localhost:PORT     │  (gdb.c / x86/gdb.c)   │ │
+│  └─────────┘                     └──────────┬─────────────┘ │
+│                                             │ KVM ioctls    │
+│                                  ┌──────────▼─────────────┐ │
+│                                  │  KVM vCPU threads      │ │
+│                                  │  KVM_EXIT_DEBUG        │ │
+│                                  │  KVM_SET_GUEST_DEBUG   │ │
+│                                  └──────────┬─────────────┘ │
+│                                             │               │
+│  ┌──────────────────────────────────────────▼─────────────┐ │
+│  │  Guest VM (Linux kernel)                               │ │
+│  └────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 通用层（`gdb.c`）
@@ -62,7 +59,7 @@ Guest
 
 ## 3. 线程模型与同步
 
-### 3.0 停机/恢复时序图（Mermaid）
+### 3.1 停机/恢复时序图（Mermaid）
 
 ```mermaid
 sequenceDiagram
@@ -92,7 +89,7 @@ sequenceDiagram
 
 ## 4. 方案落地
 
-## 4.1 x86 方案
+### 4.1 x86 方案
 
 - 新增 x86 架构实现：`x86/gdb.c`
 - Makefile 接入 x86 架构编译路径
@@ -106,10 +103,11 @@ sequenceDiagram
 - 恢复执行前修正 `TF/RF`
 - 单步窗口按需处理 IF，降低中断路径抢占
 
-## 4.2 arm64 方案
+### 4.2 arm64 方案
 
 - 新增 arm64 架构实现：`arm/aarch64/gdb.c`
 - Makefile 接入 arm64 架构编译路径
+- 本提交补全 arm64 架构与单步路径，和 x86 共用同一套通用协议层
 - 支持：
   - 基础寄存器集映射
   - 断点/观察点编程
@@ -120,7 +118,7 @@ sequenceDiagram
 - 单步窗口保存并临时调整 DAIF（A/I/F）
 - stop 后恢复原始中断屏蔽状态
 
-## 4.3 通用增强
+### 4.3 通用增强
 
 - 软件断点生命周期管理（含 step-over）
 - 二进制内存写（`X` 包）转义处理

@@ -14,7 +14,7 @@
 
 ## 2. 测试架构
 
-### 2.0 图形化测试拓扑（Mermaid）
+### 2.1 图形化测试拓扑（Mermaid）
 
 ```mermaid
 flowchart LR
@@ -68,7 +68,7 @@ Host
 
 ## 4. 测试场景与步骤
 
-### 4.0 测试执行流程图（Mermaid）
+### 4.1 测试执行流程图（Mermaid）
 
 ```mermaid
 flowchart TD
@@ -79,7 +79,7 @@ flowchart TD
     S5 --> S6[判定: pass/fail + 根因]
 ```
 
-## 4.1 构建层测试
+### 4.2 构建层测试
 
 命令：
 
@@ -91,7 +91,7 @@ make
 
 - 编译通过，无新增错误
 
-## 4.2 自动化烟测（x86）
+### 4.3 自动化烟测（x86）
 
 命令：
 
@@ -111,7 +111,7 @@ make -C tests/gdb smoke
 
 - 输出 `PASS: x86 GDB stub smoke test`
 
-## 4.3 仓库级测试
+### 4.4 仓库级测试
 
 命令：
 
@@ -124,7 +124,7 @@ make check
 - PIT 测试通过
 - boot 测试成功或合理 `SKIP`
 
-## 4.4 手工调试场景（x86/arm64）
+### 4.5 手工调试场景（x86/arm64）
 
 启动：
 
@@ -149,32 +149,37 @@ finish
 - `n/si/finish` 可推进
 - 不应出现 GDB 内部断言崩溃
 
+arm64 补充检查：
+
+- 连续 `n/s` 不应几乎每步都落入 `arch/arm64/kernel/entry.S`
+- 若进入 `entry.S`，应可回到主流程而非长期困在异常入口
+
 ---
 
 ## 5. 结果解读方法
 
-## 5.1 若出现 `finish_step_over ... trap_expected`
+### 5.1 若出现 `finish_step_over ... trap_expected`
 
 关注：
 
 - 软件断点生命周期与 step-over 状态切换是否一致
 - stop/reply 与 GDB 预期是否错配
 
-## 5.2 若 x86 单步频繁跳入 APIC 中断
+### 5.2 若 x86 单步频繁跳入 APIC 中断
 
 关注：
 
 - 是否使用单核
 - 单步窗口中断控制逻辑是否生效
 
-## 5.3 若 arm64 单步频繁落入 `entry.S`
+### 5.3 若 arm64 单步频繁落入 `entry.S`
 
 关注：
 
 - `DAIF` 临时处理与恢复路径
 - 是否处于高频中断/调度噪声区
 
-## 5.4 若参数读取出现乱码
+### 5.4 若参数读取出现乱码
 
 关注：
 
